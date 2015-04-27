@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"flag"
+	"fmt"
 	"log"
 	"math/rand"
 	"net/http"
@@ -19,6 +20,8 @@ type config struct {
 	url           string
 	interval      time.Duration
 	minCompletion float64
+	host          string
+	port          int
 }
 
 // Mirror is a description of an Arch Linux Mirror
@@ -49,6 +52,8 @@ func init() {
 	flag.StringVar(&conf.url, "url", "https://www.archlinux.org/mirrors/status/json/", "upstream mirror information URL")
 	flag.DurationVar(&conf.interval, "interval", time.Hour, "auto update time in minutes")
 	flag.Float64Var(&conf.minCompletion, "completion", 1.0, "minimum mirror completion threshold")
+	flag.StringVar(&conf.host, "host", "0.0.0.0", "host to listen for connections on")
+	flag.IntVar(&conf.port, "port", 9090, "port to listen for on")
 }
 
 func main() {
@@ -71,8 +76,12 @@ func main() {
 	mux.HandleFunc("/country/", countryHandler)
 	mux.HandleFunc("/global", globalHandler)
 
+	addr := fmt.Sprintf("%s:%d", conf.host, conf.port)
+
+	log.Printf("Listening on %s", addr)
+
 	// serve forever
-	http.ListenAndServe(":9000", mux)
+	http.ListenAndServe(addr, mux)
 }
 
 // update performs a mirror status update whenever the ticker ticks, i.e.

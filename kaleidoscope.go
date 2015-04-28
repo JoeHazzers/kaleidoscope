@@ -2,18 +2,24 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
-	"math/rand"
 	"net/http"
+	"net/url"
+	"path"
 	"regexp"
+	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
 
 var conf config
+
+type selector func(*MirrorStatus, *http.Request) (*Mirror, error)
 
 // config represents the application configuration
 type config struct {
@@ -45,8 +51,16 @@ type MirrorStatus struct {
 	NumChecks      int       `json:"num_checks"`
 	LastCheck      time.Time `json:"last_check"`
 	Version        int       `json:"version"`
-	URLs           []*Mirror `json:"urls"`
+	Global         []*Mirror `json:"urls"`
+	Countries      map[string][]*Mirror
 }
+
+// ByScore implements sort.Interface for []*Mirror based on the Score field.
+type ByScore []*Mirror
+
+func (s ByScore) Len() int           { return len(s) }
+func (s ByScore) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
+func (s ByScore) Less(i, j int) bool { return s[i].Score < s[j].Score }
 
 func init() {
 	flag.StringVar(&conf.url, "url", "https://www.archlinux.org/mirrors/status/json/", "upstream mirror information URL")
@@ -64,35 +78,37 @@ func main() {
 
 	// we want atomic writes to the global mirror status data
 	var status atomic.Value
+	done := make(chan bool)
 
 	// run the autoupdater forever
-	go update(&status, &conf)
+	go update(&status, &conf, done)
 
 	// handle the endpoints
 	mux := http.NewServeMux()
 
-	countryHandler := methodOnly("GET", makeCountryHandler(&status))
-	globalHandler := methodOnly("GET", makeGlobalHandler(&status))
-	mux.HandleFunc("/country/", countryHandler)
-	mux.HandleFunc("/global", globalHandler)
+	countryHandler := http.StripPrefix("/country", redirector(&status, countrySelector()))
+	globalHandler := http.StripPrefix("/global", redirector(&status, globalSelector))
+	mux.HandleFunc("/country/", countryHandler.(http.HandlerFunc))
+	mux.HandleFunc("/global/", globalHandler.(http.HandlerFunc))
 
 	addr := fmt.Sprintf("%s:%d", conf.host, conf.port)
 
-	log.Printf("Listening on %s", addr)
-
 	// serve forever
+	<-done
+	log.Printf("Init finished. Listening on %s", addr)
 	http.ListenAndServe(addr, mux)
 }
 
 // update performs a mirror status update whenever the ticker ticks, i.e.
 // once per configured interval.
-func update(status *atomic.Value, c *config) {
+func update(status *atomic.Value, c *config, done chan<- bool) {
 	log.Printf("Auto updater started (interval %s).", c.interval)
 	ticker := time.NewTicker(c.interval)
+	var once sync.Once
 	// perform an update operation once per tick forever
 	for {
 		log.Print("Performing auto update...")
-		newM, err := getData(c)
+		newM, err := getMirrorInfo(c)
 		// we might recover next tick, so log the error and move on.
 		if err != nil {
 			log.Print(err)
@@ -101,13 +117,17 @@ func update(status *atomic.Value, c *config) {
 		// store the new configuration in a globally atomic operation
 		status.Store(newM)
 		log.Print("Auto update complete.")
+		once.Do(func() {
+			done <- true
+			close(done)
+		})
 		<-ticker.C
 	}
 }
 
-// getData downloads and parses the mirror data from the configured URL. It also
-// filters mirrors for completion percentage and
-func getData(c *config) (*MirrorStatus, error) {
+// getMirrorInfo downloads and parses the mirror data from the configured URL.
+// It also filters mirrors for completion percentage and HTTP protocol.
+func getMirrorInfo(c *config) (*MirrorStatus, error) {
 	log.Printf("Downloading mirror list from '%s'...", c.url)
 	resp, err := http.Get(c.url)
 	if err != nil {
@@ -127,104 +147,91 @@ func getData(c *config) (*MirrorStatus, error) {
 	// nice reporting statistics
 
 	log.Printf("Filtering mirrors with HTTP and completion>=%f...", c.minCompletion)
-	totalCount, httpCount, completeCount := len(m.URLs), 0, 0
-	newURLs := make([]*Mirror, 0, totalCount)
+	totalCount, httpCount, completeCount := len(m.Global), 0, 0
+	newMirrors := make([]*Mirror, 0, totalCount)
+	m.Countries = make(map[string][]*Mirror)
+
+	sort.Stable(sort.Reverse(ByScore(m.Global)))
 
 	// filter mirrors based on completion and protocol
-	for _, url := range m.URLs {
+	for _, mirror := range m.Global {
 		var isHTTP, isComplete bool
 
-		if url.Protocol == "http" {
+		if mirror.Protocol == "http" {
 			httpCount++
 			isHTTP = true
 		}
 
-		if url.Completion >= c.minCompletion {
+		if mirror.Completion >= c.minCompletion {
 			completeCount++
 			isComplete = true
 		}
 
 		if isHTTP && isComplete {
-			newURLs = append(newURLs, url)
+			newMirrors = append(newMirrors, mirror)
+			country, ok := m.Countries[mirror.CountryCode]
+			if !ok {
+				country = make([]*Mirror, 0)
+			}
+			m.Countries[mirror.CountryCode] = append(country, mirror)
 		}
 	}
 
-	m.URLs = newURLs
+	m.Global = newMirrors
 
-	log.Printf("Mirror stats: Total: %d, HTTP: %d, Complete: %d. HTTP and Complete: %d", totalCount, httpCount, completeCount, len(newURLs))
+	log.Printf("Mirror stats: Total: %d, HTTP: %d, Complete: %d. HTTP and Complete: %d", totalCount, httpCount, completeCount, len(m.Global))
 
 	return &m, nil
 }
 
-// methodOnly restricts HTTP handlers to receiving a single HTTP method only.
-func methodOnly(method string, next http.HandlerFunc) http.HandlerFunc {
+func redirector(status *atomic.Value, s selector) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != method {
+		if r.Method != "GET" {
 			http.Error(w, http.StatusText(405), 405)
 			return
 		}
-		next.ServeHTTP(w, r)
-	}
-}
 
-// makeGlobalHandler handles worldwide mirrors, and naïvely returns any valid
-// mirror.
-func makeGlobalHandler(val *atomic.Value) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		status := val.Load().(*MirrorStatus)
-
-		// an empty mirror list is an error
-		if len(status.URLs) == 0 {
+		c := status.Load().(*MirrorStatus)
+		if len(c.Global) == 0 {
 			http.Error(w, http.StatusText(500), 500)
+			return
 		}
-
-		pick := rand.Intn(len(status.URLs))
-		http.Redirect(w, r, status.URLs[pick].URL, http.StatusFound)
-	}
-}
-
-// makeCountryHandler handlers mirrors within a two-letter country code and will
-// fail gracefully (i.e. with appropriate HTTP error) when the provided country
-// code is invalid or no valid mirrors are available for the country.
-func makeCountryHandler(val *atomic.Value) http.HandlerFunc {
-	// match against two digit country codes
-	re := regexp.MustCompile(`/([A-Za-z]{2})$`)
-	return func(w http.ResponseWriter, r *http.Request) {
-		matches := re.FindStringSubmatch(r.URL.Path)
-
-		// no match means a bogus country name
-		if len(matches) == 0 {
-			http.NotFound(w, r)
+		mirror, err := s(c, r)
+		if err != nil {
+			http.Error(w, err.Error(), 404)
 			return
 		}
 
-		// all mirror information contains uppercase country codes
-		countryCode := strings.ToUpper(matches[1])
-
-		status := val.Load().(*MirrorStatus)
-
-		// an empty mirror list is an error
-		if len(status.URLs) == 0 {
+		url, err := url.Parse(mirror.URL)
+		if err != nil {
 			http.Error(w, http.StatusText(500), 500)
-		}
-
-		// filter mirrors based on their country code
-		res := make([]*Mirror, 0, len(status.URLs))
-
-		for i, mirror := range status.URLs {
-			if mirror.CountryCode == countryCode && mirror.Completion >= 1.0 {
-				res = append(res, status.URLs[i])
-			}
-		}
-
-		// an empty list means no mirrors were found
-		if len(res) == 0 {
-			http.NotFound(w, r)
 			return
 		}
 
-		// choose a random mirror from the list and send the user to it
-		pick := rand.Intn(len(res))
-		http.Redirect(w, r, res[pick].URL, http.StatusFound)
+		url.Path = path.Join(url.Path, r.URL.Path)
+
+		http.Redirect(w, r, url.String(), 302)
+	}
+}
+
+func globalSelector(status *MirrorStatus, r *http.Request) (*Mirror, error) {
+	return status.Global[0], nil
+}
+
+func countrySelector() selector {
+	re := regexp.MustCompile(`^/([a-z]{2})(?:/|$)`)
+	return func(status *MirrorStatus, r *http.Request) (*Mirror, error) {
+		res := re.FindStringSubmatch(r.URL.Path)
+		if len(res) != 2 {
+			return nil, fmt.Errorf("invalid country code %+v", res)
+		}
+
+		country, ok := status.Countries[strings.ToUpper(res[1])]
+		if !ok {
+			return nil, errors.New("country not found")
+		}
+
+		r.URL.Path = r.URL.Path[len(res[0]):]
+		return country[0], nil
 	}
 }

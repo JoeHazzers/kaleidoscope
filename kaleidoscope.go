@@ -78,6 +78,8 @@ func main() {
 
 	// we want atomic writes to the global mirror status data
 	var status atomic.Value
+	// wait for the first update to occur to avoid nil pointers
+	// TODO: check for nil pointers instead
 	done := make(chan bool)
 
 	// run the autoupdater forever
@@ -86,6 +88,7 @@ func main() {
 	// handle the endpoints
 	mux := http.NewServeMux()
 
+	// register application endpoints
 	countryHandler := http.StripPrefix("/country", redirector(&status, countrySelector()))
 	globalHandler := http.StripPrefix("/global", redirector(&status, globalSelector))
 	mux.HandleFunc("/country/", countryHandler.(http.HandlerFunc))
@@ -168,6 +171,8 @@ func getMirrorInfo(c *config) (*MirrorStatus, error) {
 		}
 
 		if isHTTP && isComplete {
+			// append the mirror to the new list, and add it to its respective
+			// country list
 			newMirrors = append(newMirrors, mirror)
 			country, ok := m.Countries[mirror.CountryCode]
 			if !ok {
@@ -184,24 +189,31 @@ func getMirrorInfo(c *config) (*MirrorStatus, error) {
 	return &m, nil
 }
 
-func redirector(status *atomic.Value, s selector) http.HandlerFunc {
+// redirector calls the provided selector to choose a mirror for the request,
+// and then redirects the client to the new URL.
+func redirector(status *atomic.Value, sel selector) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" {
 			http.Error(w, http.StatusText(405), 405)
 			return
 		}
 
+		// internal error on empty mirror list
 		c := status.Load().(*MirrorStatus)
 		if len(c.Global) == 0 {
 			http.Error(w, http.StatusText(500), 500)
 			return
 		}
-		mirror, err := s(c, r)
+
+		// perform mirror selection
+		mirror, err := sel(c, r)
+		// mirror wasn't found, so 404 it
 		if err != nil {
 			http.Error(w, err.Error(), 404)
 			return
 		}
 
+		// construct the new URL for the client
 		url, err := url.Parse(mirror.URL)
 		if err != nil {
 			http.Error(w, http.StatusText(500), 500)
@@ -210,6 +222,7 @@ func redirector(status *atomic.Value, s selector) http.HandlerFunc {
 
 		url.Path = path.Join(url.Path, r.URL.Path)
 
+		// up up and away!
 		http.Redirect(w, r, url.String(), 302)
 	}
 }
